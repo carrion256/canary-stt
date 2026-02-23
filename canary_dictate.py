@@ -66,6 +66,24 @@ DTYPE = np.float32
 API_HOST = "0.0.0.0"
 API_PORT = 8393
 
+
+# ── Cleanup LLM ────────────────────────────────────────────────────────────
+CLEANUP_MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
+CLEANUP_MIN_WORDS = 10  # skip LLM cleanup for very short transcripts
+CLEANUP_SYSTEM_PROMPT = """You clean up speech-to-text transcripts. Fix these issues:
+ Remove filler words and verbal tics (um, uh, like, you know, so, basically, right)
+ Remove false starts and self-corrections (keep only the corrected version)
+ Remove unnecessary repetitions
+ Fix run-on sentences with proper punctuation
+ Remove hedging phrases (I think, sort of, kind of) when they don't add meaning
+
+Rules:
+ Return ONLY the cleaned text
+ Preserve the speaker's original meaning exactly
+ Do not add new information or rephrase
+ Keep the speaker's natural vocabulary
+ If the text is already clean, return it unchanged"""
+
 # Path to cache audio chunks
 AUDIO_DIR = Path(tempfile.gettempdir()) / "canary-dictate"
 AUDIO_DIR.mkdir(exist_ok=True)
@@ -87,6 +105,8 @@ class CanaryDictate:
         self.model = None
         self.last_speech_time = 0.0
         self._silence_monitor: threading.Thread | None = None
+        self.cleanup_model = None
+        self.cleanup_tokenizer = None
 
     # ── Model Loading ──────────────────────────────────────────────────
 
@@ -102,6 +122,26 @@ class CanaryDictate:
         elapsed = time.time() - t0
         log.info(
             "Model loaded in %.1fs (%.2f GB VRAM). Ready.",
+            elapsed,
+            torch.cuda.memory_allocated() / 1e9,
+        )
+
+    def load_cleanup_model(self):
+        """Load Qwen2.5-0.5B-Instruct for transcript post-processing."""
+        log.info("Loading cleanup LLM %s (bf16)...", CLEANUP_MODEL_NAME)
+        t0 = time.time()
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        self.cleanup_tokenizer = AutoTokenizer.from_pretrained(CLEANUP_MODEL_NAME)
+        self.cleanup_model = AutoModelForCausalLM.from_pretrained(
+            CLEANUP_MODEL_NAME,
+            torch_dtype=torch.bfloat16,
+            device_map="cuda",
+        )
+        self.cleanup_model.eval()
+        elapsed = time.time() - t0
+        log.info(
+            "Cleanup LLM loaded in %.1fs (%.2f GB VRAM total). Ready.",
             elapsed,
             torch.cuda.memory_allocated() / 1e9,
         )
@@ -243,7 +283,9 @@ class CanaryDictate:
                     1.0 / rtf if rtf > 0 else 0,
                     text[:100] + "..." if len(text) > 100 else text,
                 )
-                return self.clean_transcript(text.strip()), audio_duration
+                text = self.clean_transcript(text.strip())
+                text = self.llm_clean_transcript(text)
+                return text, audio_duration
             except Exception as e:
                 log.error("Transcription failed: %s", e, exc_info=True)
                 return "", 0.0
@@ -280,6 +322,79 @@ class CanaryDictate:
         cleaned = re.sub(r"\s+([.,!?;:])", r"\1", cleaned)
         cleaned = re.sub(r"^[.,;:!?\s]+", "", cleaned)
         return cleaned.strip()
+
+    def llm_clean_transcript(self, text: str) -> str:
+        """Use Qwen2.5-0.5B-Instruct to clean up transcript disfluencies."""
+        if not text or self.cleanup_model is None:
+            return text
+
+        # Skip LLM for very short texts — not enough context to clean reliably
+        if len(text.split()) < CLEANUP_MIN_WORDS:
+            return text
+
+        try:
+            t0 = time.time()
+            messages = [
+                {"role": "system", "content": CLEANUP_SYSTEM_PROMPT},
+                {"role": "user", "content": text},
+            ]
+            prompt = self.cleanup_tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            inputs = self.cleanup_tokenizer(
+                [prompt], return_tensors="pt"
+            ).to("cuda")
+            input_len = inputs.input_ids.shape[1]
+
+            # Output should be roughly same length or shorter than input text
+            text_tokens = self.cleanup_tokenizer(
+                text, return_tensors="pt"
+            ).input_ids.shape[1]
+            max_new = min(text_tokens + 64, 4096)
+
+            with torch.inference_mode():
+                output_ids = self.cleanup_model.generate(
+                    **inputs,
+                    max_new_tokens=max_new,
+                    do_sample=False,
+                    temperature=None,
+                    top_p=None,
+                )
+
+            # Decode only the generated portion
+            generated = output_ids[0][input_len:]
+            cleaned = self.cleanup_tokenizer.decode(
+                generated, skip_special_tokens=True
+            ).strip()
+
+            elapsed = time.time() - t0
+
+            # Safety: if output is >50% longer than input, LLM hallucinated
+            if len(cleaned) > len(text) * 1.5:
+                log.warning(
+                    "LLM cleanup produced suspicious output (%.0f%% longer). "
+                    "Falling back to regex-only.",
+                    (len(cleaned) / len(text) - 1) * 100,
+                )
+                return text
+
+            # Safety: if output is empty, something went wrong
+            if not cleaned:
+                log.warning("LLM cleanup returned empty. Keeping original.")
+                return text
+
+            log.info(
+                "LLM cleanup in %.2fs (%d → %d chars): %s",
+                elapsed,
+                len(text),
+                len(cleaned),
+                cleaned[:100] + "..." if len(cleaned) > 100 else cleaned,
+            )
+            return cleaned
+
+        except Exception as e:
+            log.error("LLM cleanup failed: %s. Keeping original.", e)
+            return text
 
     def transcribe(self, audio: np.ndarray) -> str:
         """Transcribe audio from local recording. Manages state."""
@@ -497,6 +612,8 @@ def create_api(dictate: CanaryDictate):
             "status": "ok",
             "model": MODEL_NAME,
             "model_loaded": dictate.model is not None,
+            "cleanup_model": CLEANUP_MODEL_NAME,
+            "cleanup_model_loaded": dictate.cleanup_model is not None,
             "vram_gb": round(torch.cuda.memory_allocated() / 1e9, 2)
             if torch.cuda.is_available()
             else 0,
@@ -513,6 +630,7 @@ def main():
 
     # Load model (this takes a while first time — downloads ~5GB)
     dictate.load_model()
+    dictate.load_cleanup_model()
 
     # Start HTTP API server in background thread
     import uvicorn
