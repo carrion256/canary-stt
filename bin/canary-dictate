@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Toggle canary-dictate recording (SIGUSR1)
+
+PID_FILE="${XDG_RUNTIME_DIR:-/tmp}/canary-dictate.pid"
+
+if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    kill -USR1 "$(cat "$PID_FILE")"
+else
+    notify-send -t 3000 -a "Canary Dictate" "Daemon not running. Start it with: systemctl --user start canary-dictate"
+fi

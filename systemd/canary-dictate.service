@@ -1,0 +1,14 @@
+[Unit]
+Description=Canary Dictate — GPU speech-to-text daemon (Canary Qwen 2.5B)
+After=graphical-session.target pipewire.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=%h/projects/canary-stt/.venv/bin/python %h/projects/canary-stt/canary_dictate.py
+Restart=on-failure
+RestartSec=10
+Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+[Install]
+WantedBy=graphical-session.target

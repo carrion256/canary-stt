@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Cancel canary-dictate recording (SIGUSR2)
+
+PID_FILE="${XDG_RUNTIME_DIR:-/tmp}/canary-dictate.pid"
+
+if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    kill -USR2 "$(cat "$PID_FILE")"
+else
+    notify-send -t 2000 -a "Canary Dictate" "Daemon not running."
+fi
