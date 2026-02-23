@@ -36,6 +36,7 @@ import subprocess
 import logging
 import wave
 import struct
+import re
 import uuid
 
 import torch
@@ -242,10 +243,43 @@ class CanaryDictate:
                     1.0 / rtf if rtf > 0 else 0,
                     text[:100] + "..." if len(text) > 100 else text,
                 )
-                return text.strip(), audio_duration
+                return self.clean_transcript(text.strip()), audio_duration
             except Exception as e:
                 log.error("Transcription failed: %s", e, exc_info=True)
                 return "", 0.0
+
+    @staticmethod
+    def clean_transcript(text: str) -> str:
+        """Remove filler words and speech disfluencies from transcription."""
+        if not text:
+            return text
+
+        # Filler words/phrases to remove (case-insensitive)
+        # Match filler optionally followed by comma/punctuation
+        fillers = [
+            r"\buh huh\b",
+            r"\bmm hmm\b",
+            r"\byou know\b",
+            r"\bI mean\b",
+            r"\bumm\b",
+            r"\berm\b",
+            r"\bhmm\b",
+            r"\bhuh\b",
+            r"\buh\b",
+            r"\bum\b",
+            r"\bah\b",
+        ]
+        # Match filler + optional trailing comma/space
+        pattern = re.compile(
+            r"(?:" + "|".join(fillers) + r")\s*,?\s*",
+            re.IGNORECASE,
+        )
+        cleaned = pattern.sub("", text)
+        # Collapse multiple spaces and fix punctuation
+        cleaned = re.sub(r"\s{2,}", " ", cleaned)
+        cleaned = re.sub(r"\s+([.,!?;:])", r"\1", cleaned)
+        cleaned = re.sub(r"^[.,;:!?\s]+", "", cleaned)
+        return cleaned.strip()
 
     def transcribe(self, audio: np.ndarray) -> str:
         """Transcribe audio from local recording. Manages state."""
