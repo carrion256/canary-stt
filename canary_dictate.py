@@ -35,8 +35,6 @@ import tempfile
 import subprocess
 import logging
 import wave
-import struct
-import re
 import uuid
 
 import torch
@@ -70,19 +68,19 @@ API_PORT = 8393
 # ── Cleanup LLM ────────────────────────────────────────────────────────────
 CLEANUP_MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 CLEANUP_MIN_WORDS = 10  # skip LLM cleanup for very short transcripts
-CLEANUP_SYSTEM_PROMPT = """You clean up speech-to-text transcripts. Fix these issues:
- Remove filler words and verbal tics (um, uh, like, you know, so, basically, right)
- Remove false starts and self-corrections (keep only the corrected version)
- Remove unnecessary repetitions
- Fix run-on sentences with proper punctuation
- Remove hedging phrases (I think, sort of, kind of) when they don't add meaning
-
-Rules:
- Return ONLY the cleaned text
- Preserve the speaker's original meaning exactly
- Do not add new information or rephrase
- Keep the speaker's natural vocabulary
- If the text is already clean, return it unchanged"""
+CLEANUP_SYSTEM_PROMPT = """You polish speech-to-text transcripts for readability while preserving every spoken word.
+ Your ONLY job is punctuation, capitalization, and formatting — never remove or reword content.
+ Add correct punctuation (periods, commas, question marks, exclamation points) where the speaker's intonation implies them
+ Capitalize sentence starts and proper nouns
+ Keep ALL filler words and sounds exactly as transcribed (um, uh, erm, hmm, like, you know, I mean, etc.)
+ Keep ALL stammers and repetitions exactly as spoken (e.g. "the the" stays as "the the")
+ Keep ALL hedging, softening, and opinion phrases ("I think", "sort of", "kind of", "basically")
+ Keep the speaker's exact wording and vocabulary — do not rephrase, paraphrase, or summarize
+ Keep ALL nouns, names, technical terms, and specific words exactly as transcribed — even if unfamiliar
+ Do not add new words or information
+ Do not merge or split sentences beyond what punctuation naturally requires
+ Return ONLY the polished text
+ If the text already has correct punctuation and capitalization, return it unchanged"""
 
 # Path to cache audio chunks
 AUDIO_DIR = Path(tempfile.gettempdir()) / "canary-dictate"
@@ -283,45 +281,12 @@ class CanaryDictate:
                     1.0 / rtf if rtf > 0 else 0,
                     text[:100] + "..." if len(text) > 100 else text,
                 )
-                text = self.clean_transcript(text.strip())
-                text = self.llm_clean_transcript(text)
+                text = text.strip()
                 return text, audio_duration
             except Exception as e:
                 log.error("Transcription failed: %s", e, exc_info=True)
                 return "", 0.0
 
-    @staticmethod
-    def clean_transcript(text: str) -> str:
-        """Remove filler words and speech disfluencies from transcription."""
-        if not text:
-            return text
-
-        # Filler words/phrases to remove (case-insensitive)
-        # Match filler optionally followed by comma/punctuation
-        fillers = [
-            r"\buh huh\b",
-            r"\bmm hmm\b",
-            r"\byou know\b",
-            r"\bI mean\b",
-            r"\bumm\b",
-            r"\berm\b",
-            r"\bhmm\b",
-            r"\bhuh\b",
-            r"\buh\b",
-            r"\bum\b",
-            r"\bah\b",
-        ]
-        # Match filler + optional trailing comma/space
-        pattern = re.compile(
-            r"(?:" + "|".join(fillers) + r")\s*,?\s*",
-            re.IGNORECASE,
-        )
-        cleaned = pattern.sub("", text)
-        # Collapse multiple spaces and fix punctuation
-        cleaned = re.sub(r"\s{2,}", " ", cleaned)
-        cleaned = re.sub(r"\s+([.,!?;:])", r"\1", cleaned)
-        cleaned = re.sub(r"^[.,;:!?\s]+", "", cleaned)
-        return cleaned.strip()
 
     def llm_clean_transcript(self, text: str) -> str:
         """Use Qwen2.5-0.5B-Instruct to clean up transcript disfluencies."""
@@ -373,7 +338,7 @@ class CanaryDictate:
             if len(cleaned) > len(text) * 1.5:
                 log.warning(
                     "LLM cleanup produced suspicious output (%.0f%% longer). "
-                    "Falling back to regex-only.",
+                    "Keeping original.",
                     (len(cleaned) / len(text) - 1) * 100,
                 )
                 return text
